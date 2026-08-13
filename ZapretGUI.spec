@@ -4,8 +4,11 @@ from PyInstaller.utils.hooks import collect_all
 datas = []
 binaries = []
 hiddenimports = []
-tmp_ret = collect_all('customtkinter')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+# те же пакеты, что и в build.bat (--collect-all), иначе сборка
+# из .spec молча отличалась бы от сборки одной командой
+for _pkg in ('customtkinter', 'easing_functions'):
+    tmp_ret = collect_all(_pkg)
+    datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
 a = Analysis(

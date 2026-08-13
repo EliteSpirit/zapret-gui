@@ -1,0 +1,6 @@
+# Зависимости для запуска из исходников: pip install -r requirements.txt
+customtkinter>=5.2.0
+easing-functions>=1.0.4
+
+# Дополнительно для сборки .exe (см. build.bat):
+# pyinstaller>=6.0
