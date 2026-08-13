@@ -15,7 +15,7 @@ Zapret GUI — простая графическая обёртка поверх
 равно нужно закрывать самому.
 
 Установка зависимостей (один раз):
-  pip install customtkinter easing-functions
+  pip install -r requirements.txt
 
 Запуск:
   python gui.py
@@ -31,21 +31,29 @@ Zapret GUI — простая графическая обёртка поверх
 import ctypes
 import math
 import subprocess
-import winreg
+import sys
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
+
 try:
     from easing_functions import CubicEaseOut, CubicEaseInOut, BackEaseOut
 except ImportError:
     from easing_functions import CubicEaseOut, CubicEaseInOut
     BackEaseOut = CubicEaseOut
 
+IS_WINDOWS = sys.platform == "win32"
+if IS_WINDOWS:
+    import winreg
+else:  # на других ОС модуль хотя бы импортируется — main() покажет причину
+    winreg = None
+
 REGISTRY_PATH = r"Software\ZapretGUI"
 TARGET_PROCESS_NAME = "winws.exe"
 MAX_RECENT = 3
+MAX_LOG_LINES = 500  # лог держим в памяти, поэтому не даём ему расти бесконечно
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
@@ -173,6 +181,26 @@ class AnimatedDropdown(ctk.CTkFrame):
         )
         self.button.pack(fill="both", expand=True)
 
+        # Вместо <FocusOut> (ненадёжно закрывает попап при отпускании
+        # скроллбара на overrideredirect-окнах) — глобальный обработчик клика,
+        # который закрывает список только если клик реально произошёл вне него.
+        # Вешается ровно один раз на всё окно: если делать это при каждом
+        # открытии списка, обработчики накапливаются на каждый клик.
+        self.winfo_toplevel().bind_all("<Button-1>", self._on_global_click, add="+")
+
+    def _on_global_click(self, event):
+        if self.popup is None:
+            return
+        w = event.widget
+        while w is not None:
+            if w == self.popup or w == self.button:
+                return
+            try:
+                w = w.master
+            except Exception:
+                break
+        self.close()
+
     def _display_text(self):
         val = self._var.get()
         return f"{val}   ▾" if val else "нет доступных стратегий   ▾"
@@ -186,8 +214,9 @@ class AnimatedDropdown(ctk.CTkFrame):
 
     def configure_values(self, values):
         self.values = values or [""]
-        if self.values:
-            self.set(self.values[0])
+        # если выбранная стратегия никуда не делась — не сбрасываем выбор
+        current = self._var.get()
+        self.set(current if current in self.values else self.values[0])
 
     def toggle(self):
         if self.popup is not None:
@@ -252,24 +281,6 @@ class AnimatedDropdown(ctk.CTkFrame):
         if len(self.values) > max_visible:
             scrollbar.pack(side="right", fill="y")
 
-        # Вместо <FocusOut> (ненадёжно закрывает попап при
-        # отпускании скроллбара на overrideredirect-окнах) —
-        # глобальный обработчик клика, который закрывает список
-        # только если клик реально произошёл вне попапа.
-        def global_click_handler(event):
-            if self.popup is None:
-                return
-            w = event.widget
-            while w is not None:
-                if w == self.popup or w == self.button:
-                    return
-                try:
-                    w = w.master
-                except Exception:
-                    break
-            self.close()
-
-        root.bind_all("<Button-1>", global_click_handler, add="+")
         self.popup.focus_force()
 
         def on_step(t):
@@ -357,6 +368,7 @@ class ZapretGUI(ctk.CTk):
 
         center = ctk.CTkFrame(self.welcome, fg_color="transparent")
         center.place(relx=0.5, rely=0.46, anchor="center")
+        self.welcome_center = center
 
         self.welcome_icon = ctk.CTkLabel(center, text="🛡️", font=("Segoe UI Emoji", 72))
         self.welcome_icon.pack(pady=(0, 18))
@@ -420,8 +432,7 @@ class ZapretGUI(ctk.CTk):
         animate(self, DUR_SCREEN_TRANSITION, on_step, easing_cls=CubicEaseOut)
 
     def continue_from_welcome(self):
-        center = self.welcome.winfo_children()[0]
-        center.place_forget()
+        self.welcome_center.place_forget()
 
         transition_label = ctk.CTkLabel(self.welcome, text="🚫", font=("Segoe UI Emoji", 10))
         transition_label.place(relx=0.5, rely=0.46, anchor="center")
@@ -494,7 +505,9 @@ class ZapretGUI(ctk.CTk):
         self.main_container.grid_columnconfigure(0, weight=1)
 
         # --- Акцентная полоска сверху, отражает общий статус ---
-        self.top_accent = ctk.CTkFrame(self.main_container, height=3, corner_radius=0, fg_color=COLOR_CARD_BORDER)
+        self.top_accent = ctk.CTkFrame(
+            self.main_container, height=3, corner_radius=0, fg_color=COLOR_CARD_BORDER
+        )
         self.top_accent.grid(row=0, column=0, sticky="ew")
         self.main_container.grid_rowconfigure(0, weight=0)
 
@@ -533,12 +546,15 @@ class ZapretGUI(ctk.CTk):
         self.log_btn.pack(side="left", padx=(0, 8))
 
         self.status_badge = ctk.CTkFrame(
-            right_cluster, corner_radius=999, fg_color="#1c2128", border_width=1, border_color=COLOR_CARD_BORDER
+            right_cluster, corner_radius=999, fg_color="#1c2128",
+            border_width=1, border_color=COLOR_CARD_BORDER,
         )
         self.status_badge.pack(side="left")
         badge_inner = ctk.CTkFrame(self.status_badge, fg_color="transparent")
         badge_inner.pack(padx=14, pady=6)
-        self.status_dot = ctk.CTkLabel(badge_inner, text="●", text_color=COLOR_MUTED, font=ctk.CTkFont(size=13))
+        self.status_dot = ctk.CTkLabel(
+            badge_inner, text="●", text_color=COLOR_MUTED, font=ctk.CTkFont(size=13)
+        )
         self.status_dot.pack(side="left", padx=(0, 6))
         self.status_label = ctk.CTkLabel(
             badge_inner, text="остановлено", text_color=COLOR_MUTED, font=ctk.CTkFont(size=12)
@@ -727,6 +743,8 @@ class ZapretGUI(ctk.CTk):
 
     def log(self, text):
         self._log_history.append(text)
+        if len(self._log_history) > MAX_LOG_LINES:
+            del self._log_history[:-MAX_LOG_LINES]
 
         if self.log_area is None:
             return
@@ -807,7 +825,8 @@ class ZapretGUI(ctk.CTk):
         if is_process_running(TARGET_PROCESS_NAME):
             messagebox.showinfo(
                 "Уже запущено",
-                "winws.exe уже работает.\n\nЧтобы запустить другую стратегию — сначала закрой окно \"zapret: ...\"."
+                "winws.exe уже работает.\n\nЧтобы запустить другую стратегию — "
+                "сначала закрой окно \"zapret: ...\"."
             )
             return
 
@@ -895,7 +914,8 @@ class ZapretGUI(ctk.CTk):
         self._running = running
         if running:
             self.status_label.configure(text="запущено", text_color=COLOR_ACCENT)
-            self.start_btn.configure(state="disabled")
+            # без явного текста кнопка навсегда застревала на "Запускается…"
+            self.start_btn.configure(state="disabled", text="●  Работает")
         else:
             self.status_dot.configure(text_color=COLOR_MUTED)
             self.status_label.configure(text="остановлено", text_color=COLOR_MUTED)
@@ -913,7 +933,7 @@ class ZapretGUI(ctk.CTk):
             c = _lerp_color(COLOR_ACCENT, COLOR_ACCENT_HOVER, t)
             self.status_dot.configure(text_color=c)
             self.top_accent.configure(fg_color=c)
-            self._pulse_phase += 0.35
+            self._pulse_phase = (self._pulse_phase + 0.35) % (2 * math.pi)
         self.after(70, self.animate_pulse)
 
     def on_close(self):
@@ -921,10 +941,19 @@ class ZapretGUI(ctk.CTk):
 
 
 def main():
+    if not IS_WINDOWS:
+        print(
+            "Zapret GUI работает только на Windows: он запускает .bat-стратегии "
+            "zapret и хранит настройки в реестре.",
+            file=sys.stderr,
+        )
+        return 1
+
     app = ZapretGUI()
     app.protocol("WM_DELETE_WINDOW", app.on_close)
     app.mainloop()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

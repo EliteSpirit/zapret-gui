@@ -3,7 +3,8 @@ REM Сборка Zapret GUI в один .exe файл через PyInstaller.
 REM Запусти этот файл (двойным кликом или из командной строки) в этой же папке.
 
 echo Устанавливаю зависимости (если ещё не установлены)...
-pip install --upgrade pyinstaller customtkinter easing-functions
+pip install --upgrade pyinstaller
+pip install --upgrade -r requirements.txt
 
 echo.
 echo Собираю gui.exe...
