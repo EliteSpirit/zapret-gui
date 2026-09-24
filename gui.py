@@ -37,6 +37,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import tkinter as tk
 import urllib.request
 import zipfile
@@ -391,48 +392,195 @@ def is_service_installed(name: str) -> bool:
         return False
 
 
-def update_zapret(zapret_dir: Path, version: str, emit):
-    """Скачивает релиз Flowseal и ставит его поверх zapret_dir. Работает в фоновом
-    потоке, поэтому с интерфейсом общается только через emit(kind, text)."""
+def is_service_running(name: str) -> bool:
+    # sc query работает и без прав администратора
+    try:
+        result = subprocess.run(
+            ["sc", "query", name], capture_output=True, text=True, creationflags=CREATE_NO_WINDOW
+        )
+        return result.returncode == 0 and "RUNNING" in result.stdout
+    except Exception:
+        return False
+
+
+ERROR_CANCELLED = 1223  # пользователь нажал «Нет» в окне UAC
+SEE_MASK_NOCLOSEPROCESS = 0x00000040
+WINDIVERT_SERVICES = ("WinDivert", "WinDivert14")
+STOP_WAIT_SECONDS = 15
+
+
+def run_elevated_and_wait(exe: str, params: str, timeout_s: int = 60) -> int:
+    """
+    Запускает exe с правами администратора (окно UAC) и ждёт завершения.
+    Обычный ShellExecute не отдаёт хэндл процесса, поэтому ShellExecuteEx.
+    """
+    from ctypes import wintypes
+
+    class ShellExecuteInfo(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.DWORD), ("fMask", ctypes.c_ulong), ("hwnd", wintypes.HWND),
+            ("lpVerb", wintypes.LPCWSTR), ("lpFile", wintypes.LPCWSTR),
+            ("lpParameters", wintypes.LPCWSTR), ("lpDirectory", wintypes.LPCWSTR),
+            ("nShow", ctypes.c_int), ("hInstApp", wintypes.HINSTANCE), ("lpIDList", ctypes.c_void_p),
+            ("lpClass", wintypes.LPCWSTR), ("hkeyClass", wintypes.HKEY), ("dwHotKey", wintypes.DWORD),
+            ("hIconOrMonitor", wintypes.HANDLE), ("hProcess", wintypes.HANDLE),
+        ]
+
+    info = ShellExecuteInfo()
+    info.cbSize = ctypes.sizeof(info)
+    info.fMask = SEE_MASK_NOCLOSEPROCESS
+    info.lpVerb = "runas"
+    info.lpFile = exe
+    info.lpParameters = params
+    info.nShow = 0  # SW_HIDE: консоль с командами показывать незачем
+
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    # мы в фоновом потоке, а ShellExecuteEx по документации требует COM в вызывающем потоке
+    ctypes.windll.ole32.CoInitializeEx(None, 0x2 | 0x4)  # APARTMENTTHREADED | DISABLE_OLE1DDE
+    if not shell32.ShellExecuteExW(ctypes.byref(info)):
+        err = ctypes.get_last_error()
+        if err == ERROR_CANCELLED:
+            raise UpdateError(
+                "Без прав администратора zapret не остановить, а без этого его файлы не перезаписать. "
+                "Подтверди запрос Windows (UAC) при следующей попытке."
+            )
+        raise UpdateError(f"Не удалось запустить остановку zapret (код {err}).")
+    try:
+        kernel32.WaitForSingleObject(info.hProcess, timeout_s * 1000)
+        code = wintypes.DWORD()
+        kernel32.GetExitCodeProcess(info.hProcess, ctypes.byref(code))
+        return code.value
+    finally:
+        kernel32.CloseHandle(info.hProcess)
+
+
+def stop_zapret(emit):
+    """
+    Перед обновлением останавливает всё, что держит файлы zapret: службу zapret
+    (иначе она поднимет winws.exe обратно), сам winws.exe и драйвер WinDivert
+    (он держит bin\\WinDivert64.sys). winws работает от администратора, поэтому
+    всё делается одним запросом UAC. Возвращает, что было запущено, чтобы
+    потом предложить запустить обратно.
+    """
+    was = {
+        "service": is_service_running("zapret"),
+        "winws": is_process_running(TARGET_PROCESS_NAME),
+    }
+    if not was["service"] and not was["winws"]:
+        return was
+
+    emit("progress", "Останавливаю zapret…")
+    emit("log", "Останавливаю zapret перед обновлением (Windows спросит права администратора)")
+    commands = []
+    if was["service"]:
+        commands.append("net stop zapret")
+    commands.append(f"taskkill /F /IM {TARGET_PROCESS_NAME}")
+    commands += [f"net stop {name}" for name in WINDIVERT_SERVICES]
+    # ошибки отдельных команд не важны (например, службы WinDivert14 может не быть):
+    # итог проверяем ниже по факту, жив ли winws.exe
+    run_elevated_and_wait("cmd.exe", "/c " + " & ".join(f"{c} >nul 2>&1" for c in commands))
+
+    for _ in range(STOP_WAIT_SECONDS * 2):
+        if not is_process_running(TARGET_PROCESS_NAME):
+            emit("log", "zapret остановлен")
+            return was
+        time.sleep(0.5)
+    raise UpdateError(
+        "winws.exe не завершился. Закрой окно \"zapret: ...\" вручную и повтори обновление."
+    )
+
+
+def start_service_elevated(name: str):
+    ctypes.windll.shell32.ShellExecuteW(None, "runas", "cmd.exe", f"/c net start {name}", None, 0)
+
+
+def download_release(version: str, tmp: Path, emit) -> Path:
+    """Скачивает и распаковывает релиз Flowseal во временную папку tmp с проверками
+    архива и версии. Возвращает папку, где лежит сама сборка."""
     if not VERSION_RE.match(version):
         raise UpdateError(f"Некорректная версия: {version!r}")
 
+    zip_path = tmp / "release.zip"
+    url = FLOWSEAL_ZIP_URL.format(v=version)
+    emit("log", f"Скачиваю {url}")
+
+    last_pct = [-1]
+
+    def on_progress(done, total):
+        pct = done * 100 // total if total else -1
+        if pct != last_pct[0]:
+            last_pct[0] = pct
+            emit("progress", f"Загрузка… {pct}%" if pct >= 0 else f"Загрузка… {done // 1024} КБ")
+
+    try:
+        download_file(url, zip_path, on_progress)
+    except UpdateError:
+        raise
+    except Exception as e:
+        raise UpdateError(f"Не удалось скачать релиз {version}: {e}") from e
+
+    emit("progress", "Распаковка…")
+    extracted = tmp / "extracted"
+    try:
+        extract_zip_safely(zip_path, extracted)
+    except zipfile.BadZipFile as e:
+        raise UpdateError(f"Скачанный архив повреждён: {e}") from e
+
+    new_root = find_release_root(extracted)
+    if new_root is None:
+        raise UpdateError(
+            "В архиве не нашлось service.bat и bin\\winws.exe — структура релиза изменилась."
+        )
+    new_version = read_local_version(new_root)
+    if new_version != version:
+        raise UpdateError(f"В архиве версия {new_version!r}, а ожидалась {version!r}.")
+    return new_root
+
+
+FRESH_INSTALL_DIRNAME = "zapret-discord-youtube"
+
+
+def fresh_install_target(chosen: Path) -> Path:
+    """В пустую папку ставим прямо в неё, в непустую (Рабочий стол и т.п.) — в подпапку,
+    чтобы не вывалить сотню файлов рядом с чужими."""
+    if not chosen.exists() or not any(chosen.iterdir()):
+        return chosen
+    return chosen / FRESH_INSTALL_DIRNAME
+
+
+def install_zapret_fresh(chosen: Path, emit) -> Path:
+    """Первая установка: скачивает последний релиз Flowseal в выбранную папку.
+    Возвращает папку, куда он встал."""
+    target = fresh_install_target(chosen)
+    if target.exists() and any(target.iterdir()):
+        raise UpdateError(
+            f"Папка {target} уже существует и не пустая. Если там уже zapret, ответь «Да» "
+            "на вопрос «У тебя уже скачан zapret?» и выбери эту папку. Иначе укажи другое место."
+        )
+    emit("progress", "Проверяю версию…")
+    try:
+        version = fetch_latest_version()
+    except Exception as e:
+        raise UpdateError(f"Не удалось узнать последнюю версию zapret: {e}") from e
+
+    with tempfile.TemporaryDirectory(prefix="zapretgui-install-") as tmp:
+        new_root = download_release(version, Path(tmp), emit)
+        emit("progress", "Установка…")
+        try:
+            shutil.copytree(new_root, target, dirs_exist_ok=True)
+        except OSError as e:
+            raise UpdateError(f"Не удалось записать файлы в {target}: {e}") from e
+    emit("log", f"zapret {version} установлен в {target}")
+    return target
+
+
+def update_zapret(zapret_dir: Path, version: str, emit):
+    """Скачивает релиз Flowseal и ставит его поверх zapret_dir. Работает в фоновом
+    потоке, поэтому с интерфейсом общается только через emit(kind, text)."""
     with tempfile.TemporaryDirectory(prefix="zapretgui-update-") as tmp:
         tmp = Path(tmp)
-        zip_path = tmp / "release.zip"
-        url = FLOWSEAL_ZIP_URL.format(v=version)
-        emit("log", f"Скачиваю {url}")
-
-        last_pct = [-1]
-
-        def on_progress(done, total):
-            pct = done * 100 // total if total else -1
-            if pct != last_pct[0]:
-                last_pct[0] = pct
-                emit("progress", f"Загрузка… {pct}%" if pct >= 0 else f"Загрузка… {done // 1024} КБ")
-
-        try:
-            download_file(url, zip_path, on_progress)
-        except UpdateError:
-            raise
-        except Exception as e:
-            raise UpdateError(f"Не удалось скачать релиз {version}: {e}") from e
-
-        emit("progress", "Распаковка…")
-        extracted = tmp / "extracted"
-        try:
-            extract_zip_safely(zip_path, extracted)
-        except zipfile.BadZipFile as e:
-            raise UpdateError(f"Скачанный архив повреждён: {e}") from e
-
-        new_root = find_release_root(extracted)
-        if new_root is None:
-            raise UpdateError(
-                "В архиве не нашлось service.bat и bin\\winws.exe — структура релиза изменилась."
-            )
-        new_version = read_local_version(new_root)
-        if new_version != version:
-            raise UpdateError(f"В архиве версия {new_version!r}, а ожидалась {version!r}.")
+        new_root = download_release(version, tmp, emit)
 
         # проверяем ещё раз прямо перед копированием: пока шла загрузка, стратегию могли запустить
         if is_process_running(TARGET_PROCESS_NAME):
@@ -726,8 +874,8 @@ class ZapretGUI(ctk.CTk):
         ).pack(anchor="w")
         ctk.CTkLabel(
             note_inner,
-            text="На следующем шаге нужно будет указать папку, куда распакован zapret —\n"
-                 "именно там, где лежат файлы general*.bat и service.bat.",
+            text="Дальше укажи папку с zapret от Flowseal (где лежат general*.bat\n"
+                 "и service.bat). Если его ещё нет, программа скачает его сама.",
             font=ctk.CTkFont(size=12), text_color=COLOR_MUTED, anchor="w", justify="left"
         ).pack(anchor="w", pady=(4, 0))
 
@@ -1156,7 +1304,42 @@ class ZapretGUI(ctk.CTk):
         if saved and Path(saved).exists():
             self.set_directory(Path(saved))
         else:
+            self.first_run_setup()
+
+    def first_run_setup(self):
+        have = messagebox.askyesno(
+            "zapret",
+            "У тебя уже скачан zapret от Flowseal (zapret-discord-youtube)?\n\n"
+            "Да — выбрать его папку.\n"
+            "Нет — программа сама скачает последнюю версию с GitHub в папку, которую ты укажешь.",
+        )
+        if have:
             self.choose_directory()
+            return
+        chosen = filedialog.askdirectory(title="Куда скачать zapret?")
+        if not chosen:
+            self.log("Установка zapret отменена: папка не выбрана")
+            return
+
+        self._set_updating(True)
+        self.log(f"Скачиваю zapret в {chosen}")
+
+        def on_ok(target):
+            self._set_updating(False)
+            self.set_directory(target)
+            messagebox.showinfo(
+                "Готово", f"zapret скачан в\n{target}\n\nВыбери стратегию и нажми «Запустить»."
+            )
+
+        def on_err(e):
+            self._set_updating(False)
+            self.refresh_version_info()
+            self.poll_status_once()
+            self.log(f"Не удалось скачать zapret: {e}")
+            if messagebox.askretrycancel("Не удалось скачать zapret", f"{e}\n\nПопробовать ещё раз?"):
+                self.first_run_setup()
+
+        self._run_in_background(lambda emit: install_zapret_fresh(Path(chosen), emit), on_ok, on_err)
 
     def choose_directory(self):
         if self._updating:
@@ -1391,22 +1574,26 @@ class ZapretGUI(ctk.CTk):
             f"Установлена версия {local}, доступна {latest}.\n\n"
             f"Скачать релиз с github.com/{FLOWSEAL_REPO} и установить поверх текущей папки?\n\n"
             "Твои списки (*-user.txt), настройки game filter и режим ipset сохранятся. "
-            "Если что-то пойдёт не так, изменения откатятся.",
+            "Если что-то пойдёт не так, изменения откатятся."
+            + (
+                "\n\nzapret сейчас запущен: на время обновления он будет остановлен "
+                "(Windows спросит права администратора), потом предложу запустить его снова."
+                if is_process_running(TARGET_PROCESS_NAME) or is_service_running("zapret")
+                else ""
+            ),
         ):
-            return
-
-        if is_process_running(TARGET_PROCESS_NAME):
-            messagebox.showwarning(
-                "zapret запущен",
-                "winws.exe сейчас работает и держит свои файлы.\n\n"
-                "Закрой окно \"zapret: ...\" (а если стоит служба — удали её через "
-                "service.bat), затем повтори обновление.",
-            )
             return
 
         zapret_dir = self.zapret_dir
         self._set_updating(True)
         self.log(f"Обновляю zapret {local} → {latest}")
+
+        # что было запущено до обновления — заполняется в фоновом потоке
+        stopped = {"service": False, "winws": False}
+
+        def work(emit):
+            stopped.update(stop_zapret(emit))
+            return update_zapret(zapret_dir, latest, emit)
 
         def on_ok(version):
             self._set_updating(False)
@@ -1416,6 +1603,7 @@ class ZapretGUI(ctk.CTk):
             self.refresh_version_info()
             self.poll_status_once()
             messagebox.showinfo("Готово", f"zapret обновлён до версии {version}.")
+            self._offer_restart(stopped)
 
         def on_err(e):
             self._set_updating(False)
@@ -1423,8 +1611,23 @@ class ZapretGUI(ctk.CTk):
             self.poll_status_once()
             self.log(f"Ошибка обновления: {e}")
             messagebox.showerror("Обновление не удалось", str(e))
+            # файлы откатились к старой версии — её тоже можно запустить обратно
+            self._offer_restart(stopped)
 
-        self._run_in_background(lambda emit: update_zapret(zapret_dir, latest, emit), on_ok, on_err)
+        self._run_in_background(work, on_ok, on_err)
+
+    def _offer_restart(self, stopped):
+        if stopped["service"]:
+            if messagebox.askyesno("Запустить снова?", "Служба zapret была остановлена на время обновления. "
+                                                       "Запустить её снова?"):
+                self.log("Запускаю службу zapret")
+                start_service_elevated("zapret")
+                self.after(1500, self.poll_status_once)
+        elif stopped["winws"] and self.recent_strategies:
+            name = self.recent_strategies[0]
+            if messagebox.askyesno("Запустить снова?", f"zapret был остановлен на время обновления.\n\n"
+                                                       f"Запустить последнюю стратегию «{name}»?"):
+                self.launch_strategy_by_name(name)
 
     # ------------------------------------------------------------- status
 

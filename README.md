@@ -1,11 +1,21 @@
 # 🛡️ Zapret GUI
 
-Тёмный графический интерфейс поверх уже установленного [zapret](https://github.com/bol-van/zapret) — чтобы запускать стратегии обхода DPI кнопкой, а не поиском нужного `.bat` в проводнике.
+Запуск [zapret](https://github.com/Flowseal/zapret-discord-youtube) от Flowseal кнопкой, без консоли и меню `service.bat`. Выбрал папку, выбрал стратегию, нажал «Запустить». Обновить сам zapret тоже можно одной кнопкой.
+
+**[⬇ Скачать ZapretGUI.exe](https://github.com/EliteSpirit/zapret-gui/releases/latest)** · Windows 10 и 11, Python не нужен
 
 ![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078d4)
 ![Python](https://img.shields.io/badge/Python-3.9%2B-3776ab)
 ![CustomTkinter](https://img.shields.io/badge/UI-CustomTkinter-2ee673)
 ![License](https://img.shields.io/badge/License-MIT-lightgrey)
+
+### Быстрый старт
+
+1. Скачай `ZapretGUI.exe` по ссылке выше и запусти.
+2. Программа спросит, есть ли у тебя zapret от Flowseal. Есть — укажи его папку. Нет — выбери, куда его поставить, и программа скачает последнюю версию сама. Если папка не пустая (например, Рабочий стол), zapret ляжет в подпапку `zapret-discord-youtube`.
+3. Выбери стратегию и нажми «Запустить». Windows спросит права администратора: без них zapret не работает.
+
+Не открывается YouTube или Discord? Попробуй другую стратегию из списка. Какая сработает, зависит от провайдера.
 
 > **Это только обёртка.** Программа не трогает сетевые пакеты — она запускает существующие `general*.bat` из твоей папки. Всю реальную работу с трафиком по-прежнему делает `winws.exe`. В папке zapret программа меняет только две вещи: кладёт туда свою стратегию `general (GUI MAX).bat` (см. [ниже](#экспериментальная-стратегия-gui-max)) и обновляет файлы сборки, но только по твоему подтверждению (см. [Обновление zapret](#обновление-zapret)).
 
@@ -74,7 +84,7 @@ python gui.py
 
 **Просто закрой окно `zapret: ...`,** которое открылось после запуска.
 
-Кнопки «Остановить» здесь нет намеренно: у `.bat`-скриптов zapret есть собственный цикл перезапуска `winws.exe` при падении, из-за которого программное завершение процесса ни к чему не приводит — он тут же поднимается заново. Единственный надёжный способ — закрыть окно целиком, поэтому интерфейс прямо на это и указывает.
+Отдельной кнопки «Остановить» нет: окно `zapret: ...` и есть сам `winws.exe`, а он работает с правами администратора, так что завершить его из программы можно только через ещё один запрос UAC. Закрыть окно проще. Исключение одно: перед обновлением zapret программа останавливает его сама (см. ниже).
 
 ## Обновление zapret
 
@@ -82,7 +92,7 @@ python gui.py
 
 Что происходит по кнопке:
 
-1. Программа спрашивает подтверждение. Если `winws.exe` запущен, обновление не начнётся: сначала закрой окно `zapret: ...`, а если установлена служба, удали её через `service.bat` → *Remove Services*.
+1. Программа спрашивает подтверждение. Если zapret запущен, она останавливает его сама: службу `zapret` (если установлена), процесс `winws.exe` и драйвер WinDivert, который держит `bin\WinDivert64.sys`. Для этого Windows один раз спросит права администратора; если отказаться, обновление не начнётся. После обновления (и после неудачного тоже, когда файлы откатились) программа предложит запустить службу или последнюю стратегию обратно.
 2. Скачивается `zapret-discord-youtube-<версия>.zip` из релиза на GitHub и распаковывается во временную папку. Архив с путями вида `../` отклоняется. Если внутри нет `service.bat` и `bin\winws.exe` или версия не совпадает с ожидаемой, обновление тоже отменяется.
 3. Файлы копируются поверх текущей папки. Всё, что перезаписывается, сначала уходит в резервную копию, и при любой ошибке (например, файл занят) изменения откатываются.
 
@@ -150,13 +160,16 @@ pyinstaller --noconfirm ZapretGUI.spec
 
 ## Чего программа не умеет (осознанно)
 
-- Не меняет и не создаёт стратегии — работает только с тем, что уже есть в папке (обновление zapret заменяет их версиями из официального релиза).
+- Не меняет стратегии Flowseal: обновление zapret заменяет их версиями из официального релиза. Своя у программы только `general (GUI MAX).bat`, её она кладёт в папку сама.
 - Не обновляет сборки, отличные от Flowseal (например, оригинальный zapret от bol-van): у них другая структура, и смешивать файлы опасно.
 - Не запускает `service.bat` автоматически — только по кнопке.
-- Не пытается программно остановить `winws.exe` — причина выше.
+- Не останавливает `winws.exe` по кнопке: для этого достаточно закрыть окно `zapret: ...`. Сама она останавливает его только перед обновлением.
 - Не работает нигде, кроме Windows — на других системах просто скажет об этом и выйдет.
 
 ## Частые вопросы
+
+**Это не вирус? Антивирус ругается.**
+Исходники открыты, они все в этом репозитории. `ZapretGUI.exe` собирается из них на GitHub Actions: в [логе сборки](https://github.com/EliteSpirit/zapret-gui/actions/workflows/release.yml) видно каждый шаг. Рядом с exe в релизе лежит `ZapretGUI.exe.sha256`, по нему можно убедиться, что скачанный файл тот самый. Антивирусы иногда ругаются на программы, собранные PyInstaller, особенно если они просят права администратора. Можешь сам проверить файл на [virustotal.com](https://www.virustotal.com/). Если сомневаешься, запусти из исходников: `pip install -r requirements.txt`, потом `python gui.py`.
 
 **Список стратегий пустой.**
 Выбрана не та папка. Нужна именно та, где лежат `general*.bat` рядом с `service.bat`, а не родительская.
@@ -185,7 +198,7 @@ Team roles:
 
 This program will not transfer any information to other networked systems unless specifically requested by the user or the person installing or operating it, with one exception described below.
 
-To show whether a newer zapret build is available, Zapret GUI sends a plain HTTPS GET request to `raw.githubusercontent.com` (file `.service/version.txt` of [Flowseal/zapret-discord-youtube](https://github.com/Flowseal/zapret-discord-youtube)) on startup and when a zapret folder is selected. The request carries no personal data, only the `ZapretGUI` User-Agent; GitHub sees your IP address as with any web request. The update archive is downloaded from `github.com` only after you confirm the update. Settings are stored locally in the Windows registry.
+To show whether a newer zapret build is available, Zapret GUI sends a plain HTTPS GET request to `raw.githubusercontent.com` (file `.service/version.txt` of [Flowseal/zapret-discord-youtube](https://github.com/Flowseal/zapret-discord-youtube)) on startup and when a zapret folder is selected. The request carries no personal data, only the `ZapretGUI` User-Agent; GitHub sees your IP address as with any web request. The zapret archive is downloaded from `github.com` only after you confirm it: either an update or, on first run, the initial download of zapret. Settings are stored locally in the Windows registry.
 
 ## Лицензия
 
