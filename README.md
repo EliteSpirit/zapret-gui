@@ -1,11 +1,21 @@
 # 🛡️ Zapret GUI
 
-Тёмный графический интерфейс поверх уже установленного [zapret](https://github.com/bol-van/zapret) — чтобы запускать стратегии обхода DPI кнопкой, а не поиском нужного `.bat` в проводнике.
+Запуск [zapret](https://github.com/Flowseal/zapret-discord-youtube) от Flowseal кнопкой, без консоли и меню `service.bat`. Выбрал папку, выбрал стратегию, нажал «Запустить». Обновить сам zapret тоже можно одной кнопкой.
+
+**[⬇ Скачать ZapretGUI.exe](https://github.com/EliteSpirit/zapret-gui/releases/latest)** · Windows 10 и 11, Python не нужен
 
 ![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078d4)
 ![Python](https://img.shields.io/badge/Python-3.9%2B-3776ab)
 ![CustomTkinter](https://img.shields.io/badge/UI-CustomTkinter-2ee673)
 ![License](https://img.shields.io/badge/License-MIT-lightgrey)
+
+### Быстрый старт
+
+1. Скачай и распакуй [zapret-discord-youtube](https://github.com/Flowseal/zapret-discord-youtube/releases) от Flowseal, если его ещё нет.
+2. Скачай `ZapretGUI.exe` по ссылке выше и запусти.
+3. Укажи папку, где лежит `service.bat`, выбери стратегию и нажми «Запустить». Windows спросит права администратора: без них zapret не работает.
+
+Не открывается YouTube или Discord? Попробуй другую стратегию из списка. Какая сработает, зависит от провайдера.
 
 > **Это только обёртка.** Программа не трогает сетевые пакеты — она запускает существующие `general*.bat` из твоей папки. Всю реальную работу с трафиком по-прежнему делает `winws.exe`. В папке zapret программа меняет только две вещи: кладёт туда свою стратегию `general (GUI MAX).bat` (см. [ниже](#экспериментальная-стратегия-gui-max)) и обновляет файлы сборки, но только по твоему подтверждению (см. [Обновление zapret](#обновление-zapret)).
 
@@ -157,6 +167,9 @@ pyinstaller --noconfirm ZapretGUI.spec
 - Не работает нигде, кроме Windows — на других системах просто скажет об этом и выйдет.
 
 ## Частые вопросы
+
+**Это не вирус? Антивирус ругается.**
+Исходники открыты, они все в этом репозитории. `ZapretGUI.exe` собирается из них на GitHub Actions: в [логе сборки](https://github.com/EliteSpirit/zapret-gui/actions/workflows/release.yml) видно каждый шаг. Рядом с exe в релизе лежит `ZapretGUI.exe.sha256`, по нему можно убедиться, что скачанный файл тот самый. Антивирусы иногда ругаются на программы, собранные PyInstaller, особенно если они просят права администратора. Можешь сам проверить файл на [virustotal.com](https://www.virustotal.com/). Если сомневаешься, запусти из исходников: `pip install -r requirements.txt`, потом `python gui.py`.
 
 **Список стратегий пустой.**
 Выбрана не та папка. Нужна именно та, где лежат `general*.bat` рядом с `service.bat`, а не родительская.
