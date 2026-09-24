@@ -30,9 +30,16 @@ Zapret GUI — простая графическая обёртка поверх
 
 import ctypes
 import math
+import queue
+import re
+import shutil
 import subprocess
 import sys
+import tempfile
+import threading
 import tkinter as tk
+import urllib.request
+import zipfile
 from pathlib import Path
 from tkinter import filedialog, messagebox
 
@@ -54,6 +61,23 @@ REGISTRY_PATH = r"Software\ZapretGUI"
 TARGET_PROCESS_NAME = "winws.exe"
 MAX_RECENT = 3
 MAX_LOG_LINES = 500  # лог держим в памяти, поэтому не даём ему расти бесконечно
+
+# --- обновление сборки Flowseal/zapret-discord-youtube ---
+# Версию берём из того же файла, что и service.bat в пункте "Check Updates",
+# а архив — из релиза, который собирает их workflow (release.yml).
+FLOWSEAL_REPO = "Flowseal/zapret-discord-youtube"
+FLOWSEAL_VERSION_URL = f"https://raw.githubusercontent.com/{FLOWSEAL_REPO}/main/.service/version.txt"
+FLOWSEAL_ZIP_URL = (
+    "https://github.com/" + FLOWSEAL_REPO + "/releases/download/{v}/zapret-discord-youtube-{v}.zip"
+)
+HTTP_TIMEOUT = 15
+MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024  # релиз весит единицы мегабайт; больше — точно что-то не то
+MAX_UNPACKED_BYTES = 500 * 1024 * 1024
+# версия подставляется в URL, поэтому пропускаем только безобидные символы
+VERSION_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._-]{0,31}$")
+LOCAL_VERSION_RE = re.compile(r'set\s+"LOCAL_VERSION=([^"\r\n]+)"', re.IGNORECASE)
+# маркер режима "none" у ipset-all.txt — тот же, что проверяет service.bat
+IPSET_NONE_MARKER = "203.0.113.113/32"
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
@@ -139,6 +163,263 @@ def is_process_running(name: str) -> bool:
         return name.lower() in result.stdout.lower()
     except Exception:
         return False
+
+
+# ------------------------------------------------------------------ updater
+
+
+class UpdateError(Exception):
+    """Ошибка обновления с текстом, который можно показать пользователю как есть."""
+
+    keep_backup = False  # True — откат прошёл не полностью, бэкап удалять нельзя
+
+
+def read_local_version(zapret_dir: Path):
+    """Версия сборки Flowseal из строки set "LOCAL_VERSION=..." в service.bat.
+    None — если это не их сборка (например, оригинальный zapret от bol-van)."""
+    try:
+        text = (zapret_dir / "service.bat").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    match = LOCAL_VERSION_RE.search(text)
+    return match.group(1).strip() if match else None
+
+
+def _open_url(url):
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "ZapretGUI", "Cache-Control": "no-cache"}
+    )
+    return urllib.request.urlopen(request, timeout=HTTP_TIMEOUT)
+
+
+def fetch_latest_version():
+    with _open_url(FLOWSEAL_VERSION_URL) as resp:
+        text = resp.read(64).decode("utf-8", errors="replace").strip()
+    if not VERSION_RE.match(text):
+        raise UpdateError(f"Сервер вернул странную версию: {text!r}")
+    return text
+
+
+def _version_key(version: str):
+    return tuple(int(part) for part in re.findall(r"\d+", version))
+
+
+def is_newer(remote: str, local: str) -> bool:
+    return _version_key(remote) > _version_key(local)
+
+
+def download_file(url, dest: Path, on_progress=None):
+    with _open_url(url) as resp, open(dest, "wb") as f:
+        total = int(resp.headers.get("Content-Length") or 0)
+        done = 0
+        while True:
+            chunk = resp.read(64 * 1024)
+            if not chunk:
+                break
+            done += len(chunk)
+            if done > MAX_DOWNLOAD_BYTES:
+                raise UpdateError("Архив подозрительно большой — загрузка прервана.")
+            f.write(chunk)
+            if on_progress:
+                on_progress(done, total)
+
+
+def extract_zip_safely(zip_path: Path, dest: Path):
+    """Распаковка с защитой от путей вида ../../ (zip slip) и zip-бомб."""
+    dest = dest.resolve()
+    with zipfile.ZipFile(zip_path) as zf:
+        unpacked = 0
+        for info in zf.infolist():
+            target = (dest / info.filename).resolve()
+            if target != dest and dest not in target.parents:
+                raise UpdateError(f"Небезопасный путь в архиве: {info.filename}")
+            unpacked += info.file_size
+        if unpacked > MAX_UNPACKED_BYTES:
+            raise UpdateError("Архив распаковывается в слишком большой объём — отмена.")
+        zf.extractall(dest)
+
+
+def find_release_root(extracted: Path):
+    """Папка внутри архива, где лежит сама сборка (обычно zapret-discord-youtube-<версия>/)."""
+    candidates = [extracted] + sorted(p for p in extracted.iterdir() if p.is_dir())
+    for candidate in candidates:
+        if (candidate / "service.bat").is_file() and (candidate / "bin" / TARGET_PROCESS_NAME).is_file():
+            return candidate
+    return None
+
+
+def _ipset_mode_is_user_chosen(ipset_file: Path) -> bool:
+    """True, если пользователь переключил ipset в режим none/any через service.bat.
+    Логика та же, что в :ipset_switch_status: пустой файл — any, маркер — none."""
+    try:
+        content = ipset_file.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return not content.strip() or IPSET_NONE_MARKER in content
+
+
+def build_install_plan(new_root: Path, zapret_dir: Path):
+    """Список (файл из релиза, куда его положить относительно папки zapret).
+
+    Пользовательское состояние не трогаем:
+      * lists/*-user.txt и utils/game_filter.enabled в релиз не входят — их и не перезапишет;
+      * utils/check_updates.enabled не возвращаем, если пользователь его удалил (выключил проверку);
+      * bin/ACTIVE_*.bin — фейки, выбранные через "Replace active fakes", — оставляем свои;
+      * ipset в режиме none/any оставляем как есть, а свежий список кладём в .backup —
+        ровно туда, откуда service.bat достаёт его при переключении в loaded.
+    """
+    ipset_rel = Path("lists", "ipset-all.txt")
+    ipset_backup_rel = Path("lists", "ipset-all.txt.backup")
+    keep_ipset_mode = _ipset_mode_is_user_chosen(zapret_dir / ipset_rel)
+
+    plan = []
+    for src in sorted(new_root.rglob("*")):
+        if not src.is_file():
+            continue
+        rel = src.relative_to(new_root)
+        if rel == Path("utils", "check_updates.enabled") and not (zapret_dir / rel).exists():
+            continue
+        if rel.parent == Path("bin") and rel.name.startswith("ACTIVE_") and (zapret_dir / rel).exists():
+            continue
+        if keep_ipset_mode:
+            if rel == ipset_backup_rel:
+                continue
+            if rel == ipset_rel:
+                rel = ipset_backup_rel
+        plan.append((src, rel))
+    return plan
+
+
+def apply_install_plan(plan, zapret_dir: Path, backup_dir: Path):
+    """Копирует файлы поверх папки zapret. Всё, что перезаписывается, сначала
+    сохраняется в backup_dir; при любой ошибке изменения откатываются."""
+    replaced, created = [], []
+    try:
+        for src, rel in plan:
+            dst = zapret_dir / rel
+            if dst.exists():
+                saved = backup_dir / rel
+                saved.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(dst, saved)
+                replaced.append(rel)
+            else:
+                created.append(rel)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+    except Exception as e:
+        rollback_errors = []
+        for rel in replaced:
+            try:
+                shutil.copy2(backup_dir / rel, zapret_dir / rel)
+            except Exception as re_err:
+                rollback_errors.append(f"{rel}: {re_err}")
+        for rel in created:
+            try:
+                (zapret_dir / rel).unlink(missing_ok=True)
+            except Exception as re_err:
+                rollback_errors.append(f"{rel}: {re_err}")
+
+        hint = ""
+        if isinstance(e, PermissionError):
+            hint = (
+                "\n\nФайл занят или нет прав на запись. Закрой окно \"zapret: ...\", "
+                "удали службы через service.bat (Remove Services) и попробуй снова. "
+                "Если папка лежит в Program Files — перенеси её, например, в C:\\zapret."
+            )
+        if rollback_errors:
+            err = UpdateError(
+                f"Обновление не удалось: {e}\n\nОткатить удалось не всё — копии старых файлов "
+                f"лежат в {backup_dir}:\n" + "\n".join(rollback_errors[:10]) + hint
+            )
+            err.keep_backup = True
+            raise err from e
+        raise UpdateError(f"Обновление не удалось, изменения откачены.\n\n{e}{hint}") from e
+    return replaced, created
+
+
+def is_service_installed(name: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["sc", "query", name], capture_output=True, text=True, creationflags=CREATE_NO_WINDOW
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def update_zapret(zapret_dir: Path, version: str, emit):
+    """Скачивает релиз Flowseal и ставит его поверх zapret_dir. Работает в фоновом
+    потоке, поэтому с интерфейсом общается только через emit(kind, text)."""
+    if not VERSION_RE.match(version):
+        raise UpdateError(f"Некорректная версия: {version!r}")
+
+    with tempfile.TemporaryDirectory(prefix="zapretgui-update-") as tmp:
+        tmp = Path(tmp)
+        zip_path = tmp / "release.zip"
+        url = FLOWSEAL_ZIP_URL.format(v=version)
+        emit("log", f"Скачиваю {url}")
+
+        last_pct = [-1]
+
+        def on_progress(done, total):
+            pct = done * 100 // total if total else -1
+            if pct != last_pct[0]:
+                last_pct[0] = pct
+                emit("progress", f"Загрузка… {pct}%" if pct >= 0 else f"Загрузка… {done // 1024} КБ")
+
+        try:
+            download_file(url, zip_path, on_progress)
+        except UpdateError:
+            raise
+        except Exception as e:
+            raise UpdateError(f"Не удалось скачать релиз {version}: {e}") from e
+
+        emit("progress", "Распаковка…")
+        extracted = tmp / "extracted"
+        try:
+            extract_zip_safely(zip_path, extracted)
+        except zipfile.BadZipFile as e:
+            raise UpdateError(f"Скачанный архив повреждён: {e}") from e
+
+        new_root = find_release_root(extracted)
+        if new_root is None:
+            raise UpdateError(
+                "В архиве не нашлось service.bat и bin\\winws.exe — структура релиза изменилась."
+            )
+        new_version = read_local_version(new_root)
+        if new_version != version:
+            raise UpdateError(f"В архиве версия {new_version!r}, а ожидалась {version!r}.")
+
+        # проверяем ещё раз прямо перед копированием: пока шла загрузка, стратегию могли запустить
+        if is_process_running(TARGET_PROCESS_NAME):
+            raise UpdateError("winws.exe запущен — закрой окно \"zapret: ...\" и повтори обновление.")
+
+        emit("progress", "Установка…")
+        plan = build_install_plan(new_root, zapret_dir)
+        # бэкап вне временной папки: если откат не удастся, копии старых файлов
+        # должны пережить выход из with, иначе сообщению об ошибке не на что сослаться
+        backup_dir = Path(tempfile.mkdtemp(prefix="zapretgui-backup-"))
+        try:
+            replaced, created = apply_install_plan(plan, zapret_dir, backup_dir)
+        except UpdateError as e:
+            if not e.keep_backup:
+                shutil.rmtree(backup_dir, ignore_errors=True)
+            raise
+        shutil.rmtree(backup_dir, ignore_errors=True)
+
+        new_bats = {p.name for p in new_root.glob("general*.bat")}
+        orphaned = sorted(p.name for p in zapret_dir.glob("general*.bat") if p.name not in new_bats)
+
+    emit("log", f"Обновлено файлов: {len(replaced)}, добавлено новых: {len(created)}.")
+    if orphaned:
+        emit("log", "Этих стратегий нет в новой версии, оставил как есть: " + ", ".join(orphaned))
+    if is_service_installed("zapret"):
+        emit(
+            "log",
+            "Установлена служба zapret со старыми параметрами — переустанови её "
+            "через service.bat (Install Service), чтобы она подхватила новую версию.",
+        )
+    return version
 
 
 def animate(widget, duration_ms, on_step, on_done=None, easing_cls=CubicEaseOut):
@@ -349,6 +630,8 @@ class ZapretGUI(ctk.CTk):
         self.log_area = None
         self._log_popup = None
         self.recent_strategies = self.config_data.get("recent_strategies", [])
+        self._updating = False
+        self._latest_version = None
 
         try:
             self.attributes("-alpha", 0.0)
@@ -587,6 +870,19 @@ class ZapretGUI(ctk.CTk):
             command=self.open_service_bat
         ).grid(row=1, column=2, padx=(0, 16), pady=(2, 14))
 
+        # строка версии: что стоит локально и что лежит в релизах Flowseal
+        self.version_label = ctk.CTkLabel(
+            dir_card, text="", anchor="w", font=ctk.CTkFont(size=12), text_color=COLOR_MUTED
+        )
+        self.version_label.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 14))
+
+        self.update_btn = ctk.CTkButton(
+            dir_card, text="⬇ Проверить обновления", width=238, corner_radius=CORNER_RADIUS,
+            fg_color="#21262d", hover_color="#30363d", text_color=COLOR_TEXT,
+            command=self.check_and_update,
+        )
+        self.update_btn.grid(row=2, column=1, columnspan=2, sticky="e", padx=(8, 16), pady=(0, 14))
+
         # --- Strategy card ---
         strategy_card = self._card()
         strategy_card.grid(row=3, column=0, sticky="ew", padx=24, pady=(0, 14))
@@ -794,6 +1090,9 @@ class ZapretGUI(ctk.CTk):
             self.choose_directory()
 
     def choose_directory(self):
+        if self._updating:
+            messagebox.showinfo("Идёт обновление", "Дождись окончания обновления zapret.")
+            return
         chosen = filedialog.askdirectory(title="Выбери папку с zapret (где general*.bat и service.bat)")
         if chosen:
             self.set_directory(Path(chosen))
@@ -805,6 +1104,7 @@ class ZapretGUI(ctk.CTk):
         save_config(self.config_data)
         self.refresh_strategies()
         self.update_hint()
+        self.refresh_version_info(check_remote=True)
 
     def refresh_strategies(self):
         if not self.zapret_dir:
@@ -822,6 +1122,9 @@ class ZapretGUI(ctk.CTk):
     # ------------------------------------------------------------- actions
 
     def start_strategy(self):
+        if self._updating:
+            messagebox.showinfo("Идёт обновление", "Дождись окончания обновления zapret.")
+            return
         if is_process_running(TARGET_PROCESS_NAME):
             messagebox.showinfo(
                 "Уже запущено",
@@ -882,6 +1185,165 @@ class ZapretGUI(ctk.CTk):
             self.log(f"Ошибка открытия service.bat: {e}")
             messagebox.showerror("Ошибка", str(e))
 
+    # ------------------------------------------------------------- update
+
+    def _run_in_background(self, work, on_ok, on_err):
+        """Запускает work(emit) в потоке. Tk не потокобезопасен, поэтому поток
+        только кладёт события в очередь, а виджеты трогает главный цикл."""
+        events = queue.Queue()
+
+        def runner():
+            try:
+                events.put(("ok", work(lambda kind, text: events.put((kind, text)))))
+            except Exception as e:
+                events.put(("err", e))
+
+        threading.Thread(target=runner, daemon=True).start()
+
+        def pump():
+            try:
+                while True:
+                    kind, value = events.get_nowait()
+                    if kind == "log":
+                        self.log(value)
+                    elif kind == "progress":
+                        self.update_btn.configure(text=value)
+                    elif kind == "ok":
+                        on_ok(value)
+                        return
+                    elif kind == "err":
+                        on_err(value)
+                        return
+            except queue.Empty:
+                pass
+            self.after(100, pump)
+
+        self.after(100, pump)
+
+    def refresh_version_info(self, check_remote=False):
+        local = read_local_version(self.zapret_dir) if self.zapret_dir else None
+        if not self.zapret_dir:
+            text = ""
+        elif local is None:
+            text = "версия неизвестна — это не сборка Flowseal"
+        elif self._latest_version and is_newer(self._latest_version, local):
+            text = f"версия {local}  ·  доступна {self._latest_version}"
+        elif self._latest_version:
+            text = f"версия {local}  ·  последняя"
+        else:
+            text = f"версия {local}"
+        self.version_label.configure(text=text)
+
+        if self._updating:
+            return
+        if local and self._latest_version and is_newer(self._latest_version, local):
+            self.update_btn.configure(
+                text=f"⬇ Обновить до {self._latest_version}",
+                fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER, text_color="#0b0d12",
+            )
+        else:
+            self.update_btn.configure(
+                text="⬇ Проверить обновления",
+                fg_color="#21262d", hover_color="#30363d", text_color=COLOR_TEXT,
+            )
+
+        if check_remote and local:
+            # тихая проверка при выборе папки: без диалогов, ошибка сети — только строка в логе
+            def on_ok(latest):
+                self._latest_version = latest
+                self.refresh_version_info()
+
+            def on_err(e):
+                self.log(f"Не удалось проверить обновления zapret: {e}")
+
+            self._run_in_background(lambda emit: fetch_latest_version(), on_ok, on_err)
+
+    def _set_updating(self, updating):
+        self._updating = updating
+        self.update_btn.configure(state="disabled" if updating else "normal")
+        if updating:
+            self.start_btn.configure(state="disabled", text="Обновление…")
+
+    def check_and_update(self):
+        if self._updating:
+            return
+        if not self.zapret_dir:
+            messagebox.showwarning("Нет папки", "Сначала выбери папку с zapret.")
+            return
+
+        local = read_local_version(self.zapret_dir)
+        if local is None:
+            messagebox.showerror(
+                "Не сборка Flowseal",
+                "В service.bat не нашлось строки LOCAL_VERSION — похоже, это не сборка "
+                "Flowseal/zapret-discord-youtube.\n\nОбновлять её их релизом небезопасно: "
+                "файлы разных сборок перемешаются.",
+            )
+            return
+
+        self._set_updating(True)
+        self.update_btn.configure(text="Проверяю…")
+        self.log("Проверяю последнюю версию zapret-discord-youtube…")
+
+        def on_err(e):
+            self._set_updating(False)
+            self.refresh_version_info()
+            self.log(f"Не удалось проверить обновления: {e}")
+            messagebox.showerror("Ошибка", f"Не удалось проверить обновления:\n{e}")
+
+        self._run_in_background(
+            lambda emit: fetch_latest_version(), lambda latest: self._offer_update(local, latest), on_err
+        )
+
+    def _offer_update(self, local, latest):
+        self._latest_version = latest
+        self._set_updating(False)
+        self.refresh_version_info()
+
+        if not is_newer(latest, local):
+            self.log(f"Установлена последняя версия: {local}")
+            messagebox.showinfo("Обновлений нет", f"У тебя последняя версия zapret: {local}.")
+            return
+
+        if not messagebox.askyesno(
+            "Доступно обновление",
+            f"Установлена версия {local}, доступна {latest}.\n\n"
+            f"Скачать релиз с github.com/{FLOWSEAL_REPO} и установить поверх текущей папки?\n\n"
+            "Твои списки (*-user.txt), настройки game filter и режим ipset сохранятся. "
+            "Если что-то пойдёт не так, изменения откатятся.",
+        ):
+            return
+
+        if is_process_running(TARGET_PROCESS_NAME):
+            messagebox.showwarning(
+                "zapret запущен",
+                "winws.exe сейчас работает и держит свои файлы.\n\n"
+                "Закрой окно \"zapret: ...\" (а если стоит служба — удали её через "
+                "service.bat), затем повтори обновление.",
+            )
+            return
+
+        zapret_dir = self.zapret_dir
+        self._set_updating(True)
+        self.log(f"Обновляю zapret {local} → {latest}")
+
+        def on_ok(version):
+            self._set_updating(False)
+            self.log(f"Готово: zapret обновлён до {version}.")
+            self.refresh_strategies()
+            self.refresh_version_info()
+            self.poll_status_once()
+            messagebox.showinfo("Готово", f"zapret обновлён до версии {version}.")
+
+        def on_err(e):
+            self._set_updating(False)
+            self.refresh_version_info()
+            self.poll_status_once()
+            self.log(f"Ошибка обновления: {e}")
+            messagebox.showerror("Обновление не удалось", str(e))
+
+        self._run_in_background(lambda emit: update_zapret(zapret_dir, latest, emit), on_ok, on_err)
+
     # ------------------------------------------------------------- status
 
     def update_hint(self):
@@ -908,23 +1370,31 @@ class ZapretGUI(ctk.CTk):
                 text_color=COLOR_READY_TEXT,
             )
 
-    def poll_status(self):
+    def poll_status_once(self):
         running = is_process_running(TARGET_PROCESS_NAME)
         was_running = getattr(self, "_running", None)
         self._running = running
         if running:
             self.status_label.configure(text="запущено", text_color=COLOR_ACCENT)
-            # без явного текста кнопка навсегда застревала на "Запускается…"
-            self.start_btn.configure(state="disabled", text="●  Работает")
         else:
             self.status_dot.configure(text_color=COLOR_MUTED)
             self.status_label.configure(text="остановлено", text_color=COLOR_MUTED)
-            self.start_btn.configure(state="normal", text="▶  Запустить")
             self.top_accent.configure(fg_color=COLOR_CARD_BORDER)
+
+        if self._updating:
+            # пока файлы zapret переписываются, запускать стратегию нельзя
+            self.start_btn.configure(state="disabled", text="Обновление…")
+        elif running:
+            # без явного текста кнопка навсегда застревала на "Запускается…"
+            self.start_btn.configure(state="disabled", text="●  Работает")
+        else:
+            self.start_btn.configure(state="normal", text="▶  Запустить")
 
         if running != was_running:
             self.update_hint()
 
+    def poll_status(self):
+        self.poll_status_once()
         self.after(1000, self.poll_status)
 
     def animate_pulse(self):
@@ -937,6 +1407,10 @@ class ZapretGUI(ctk.CTk):
         self.after(70, self.animate_pulse)
 
     def on_close(self):
+        if self._updating:
+            # поток обновления — daemon: закрытие окна оборвало бы копирование на полпути
+            messagebox.showwarning("Идёт обновление", "Дождись окончания обновления zapret, потом закрывай.")
+            return
         self.destroy()
 
 
