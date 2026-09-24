@@ -79,6 +79,10 @@ LOCAL_VERSION_RE = re.compile(r'set\s+"LOCAL_VERSION=([^"\r\n]+)"', re.IGNORECAS
 # маркер режима "none" у ipset-all.txt — тот же, что проверяет service.bat
 IPSET_NONE_MARKER = "203.0.113.113/32"
 
+# собственные экспериментальные стратегии, которые программа кладёт в папку zapret;
+# в собранном .exe PyInstaller распаковывает их во временную папку sys._MEIPASS
+BUNDLED_STRATEGIES_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "strategies"
+
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
 
@@ -337,6 +341,28 @@ def apply_install_plan(plan, zapret_dir: Path, backup_dir: Path):
     return replaced, created
 
 
+def bundled_strategy_names():
+    try:
+        return sorted(p.name for p in BUNDLED_STRATEGIES_DIR.glob("general*.bat"))
+    except OSError:
+        return []
+
+
+def install_bundled_strategies(zapret_dir: Path):
+    """Копирует стратегии программы в папку zapret, если их там нет или они устарели.
+    Возвращает имена скопированных файлов."""
+    installed = []
+    for name in bundled_strategy_names():
+        src = BUNDLED_STRATEGIES_DIR / name
+        dst = zapret_dir / name
+        data = src.read_bytes()
+        if dst.is_file() and dst.read_bytes() == data:
+            continue
+        dst.write_bytes(data)
+        installed.append(name)
+    return installed
+
+
 def is_service_installed(name: str) -> bool:
     try:
         result = subprocess.run(
@@ -407,7 +433,7 @@ def update_zapret(zapret_dir: Path, version: str, emit):
             raise
         shutil.rmtree(backup_dir, ignore_errors=True)
 
-        new_bats = {p.name for p in new_root.glob("general*.bat")}
+        new_bats = {p.name for p in new_root.glob("general*.bat")} | set(bundled_strategy_names())
         orphaned = sorted(p.name for p in zapret_dir.glob("general*.bat") if p.name not in new_bats)
 
     emit("log", f"Обновлено файлов: {len(replaced)}, добавлено новых: {len(created)}.")
@@ -1102,9 +1128,21 @@ class ZapretGUI(ctk.CTk):
         self.dir_label.configure(text=str(path))
         self.config_data["zapret_dir"] = str(path)
         save_config(self.config_data)
+        self.install_own_strategies()
         self.refresh_strategies()
         self.update_hint()
         self.refresh_version_info(check_remote=True)
+
+    def install_own_strategies(self):
+        # стратегии программы опираются на подпрограммы service.bat от Flowseal
+        # (load_game_filter и т.п.), в других сборках они просто не запустятся
+        if read_local_version(self.zapret_dir) is None:
+            return
+        try:
+            for name in install_bundled_strategies(self.zapret_dir):
+                self.log(f"Добавлена экспериментальная стратегия: {name}")
+        except OSError as e:
+            self.log(f"Не удалось добавить стратегии программы: {e}")
 
     def refresh_strategies(self):
         if not self.zapret_dir:
@@ -1330,6 +1368,7 @@ class ZapretGUI(ctk.CTk):
         def on_ok(version):
             self._set_updating(False)
             self.log(f"Готово: zapret обновлён до {version}.")
+            self.install_own_strategies()
             self.refresh_strategies()
             self.refresh_version_info()
             self.poll_status_once()
