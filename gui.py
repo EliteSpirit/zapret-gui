@@ -60,6 +60,8 @@ else:  # на других ОС модуль хотя бы импортируе�
 REGISTRY_PATH = r"Software\ZapretGUI"
 TARGET_PROCESS_NAME = "winws.exe"
 MAX_RECENT = 3
+WINDOW_WIDTH = 640
+DIR_LABEL_MAX_CHARS = 40  # длиннее — режем начало пути, чтобы было видно саму папку
 MAX_LOG_LINES = 500  # лог держим в памяти, поэтому не даём ему расти бесконечно
 
 # --- обновление сборки Flowseal/zapret-discord-youtube ---
@@ -122,6 +124,22 @@ def _lerp_color(c1: str, c2: str, t: float) -> str:
     g = round(g1 + (g2 - g1) * t)
     b = round(b1 + (b2 - b1) * t)
     return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def shorten_path(path, limit=DIR_LABEL_MAX_CHARS):
+    """Длинный путь режем слева по целым папкам: …\\Zapret\\zapret-discord-youtube-1.10.3"""
+    text = str(path)
+    if len(text) <= limit:
+        return text
+    sep = "\\" if "\\" in text else "/"
+    tail = ""
+    for part in reversed(text.split(sep)):
+        candidate = part + (sep + tail if tail else "")
+        if tail and len(candidate) + 2 > limit:
+            break
+        tail = candidate
+    # даже одно имя папки не влезло — тогда режем его по символам
+    return "…" + sep + tail if len(tail) + 2 <= limit else "…" + tail[-(limit - 1):]
 
 
 def load_config():
@@ -645,8 +663,9 @@ class ZapretGUI(ctk.CTk):
         super().__init__()
 
         self.title("Zapret GUI")
-        self.geometry("700x560")
-        self.minsize(580, 480)
+        self.geometry(f"{WINDOW_WIDTH}x560")
+        self.minsize(560, 480)
+        self._fitted_once = False
         self.configure(fg_color=COLOR_BG)
 
         self.config_data = load_config()
@@ -796,6 +815,8 @@ class ZapretGUI(ctk.CTk):
                 pass
             self.welcome.destroy()
             self.main_container.grid()
+            # до первой отрисовки контейнер ещё «не на экране» — подгоняем чуть позже
+            self.after(30, self.fit_to_content)
             self.load_or_ask_directory()
             self._pulse_phase = 0
             self.poll_status()
@@ -822,7 +843,7 @@ class ZapretGUI(ctk.CTk):
 
         # --- Header ---
         header = ctk.CTkFrame(self.main_container, fg_color="transparent")
-        header.grid(row=1, column=0, sticky="ew", padx=24, pady=(20, 16))
+        header.grid(row=1, column=0, sticky="ew", padx=20, pady=(14, 10))
         header.grid_columnconfigure(0, weight=1)
 
         title_row = ctk.CTkFrame(header, fg_color="transparent")
@@ -872,54 +893,54 @@ class ZapretGUI(ctk.CTk):
 
         # --- Directory card ---
         dir_card = self._card()
-        dir_card.grid(row=2, column=0, sticky="ew", padx=24, pady=(0, 14))
+        dir_card.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 10))
         dir_card.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(
             dir_card, text="ПАПКА ZAPRET", font=ctk.CTkFont(size=10, weight="bold"), text_color=COLOR_MUTED
-        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=16, pady=(12, 0))
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=16, pady=(10, 0))
 
         self.dir_label = ctk.CTkLabel(
             dir_card, text="Папка не выбрана", anchor="w", font=ctk.CTkFont(size=13), text_color=COLOR_TEXT
         )
-        self.dir_label.grid(row=1, column=0, sticky="ew", padx=16, pady=(2, 14))
+        self.dir_label.grid(row=1, column=0, sticky="ew", padx=16, pady=(2, 8))
 
         ctk.CTkButton(
             dir_card, text="Изменить", width=100, corner_radius=CORNER_RADIUS,
             fg_color="#21262d", hover_color="#30363d", text_color=COLOR_TEXT,
             command=self.choose_directory
-        ).grid(row=1, column=1, padx=(8, 8), pady=(2, 14))
+        ).grid(row=1, column=1, padx=(8, 8), pady=(2, 8))
 
         ctk.CTkButton(
             dir_card, text="⚙ service.bat", width=130, corner_radius=CORNER_RADIUS,
             fg_color="#21262d", hover_color="#30363d", text_color=COLOR_TEXT,
             command=self.open_service_bat
-        ).grid(row=1, column=2, padx=(0, 16), pady=(2, 14))
+        ).grid(row=1, column=2, padx=(0, 16), pady=(2, 8))
 
         # строка версии: что стоит локально и что лежит в релизах Flowseal
         self.version_label = ctk.CTkLabel(
             dir_card, text="", anchor="w", font=ctk.CTkFont(size=12), text_color=COLOR_MUTED
         )
-        self.version_label.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 14))
+        self.version_label.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 12))
 
         self.update_btn = ctk.CTkButton(
-            dir_card, text="⬇ Проверить обновления", width=238, corner_radius=CORNER_RADIUS,
+            dir_card, text="⬇ Проверить обновления", width=238, height=28, corner_radius=CORNER_RADIUS,
             fg_color="#21262d", hover_color="#30363d", text_color=COLOR_TEXT,
             command=self.check_and_update,
         )
-        self.update_btn.grid(row=2, column=1, columnspan=2, sticky="e", padx=(8, 16), pady=(0, 14))
+        self.update_btn.grid(row=2, column=1, columnspan=2, sticky="e", padx=(8, 16), pady=(0, 12))
 
         # --- Strategy card ---
         strategy_card = self._card()
-        strategy_card.grid(row=3, column=0, sticky="ew", padx=24, pady=(0, 14))
+        strategy_card.grid(row=3, column=0, sticky="ew", padx=20, pady=(0, 10))
         strategy_card.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(
             strategy_card, text="СТРАТЕГИЯ", font=ctk.CTkFont(size=10, weight="bold"), text_color=COLOR_MUTED
-        ).grid(row=0, column=0, sticky="w", padx=16, pady=(12, 4))
+        ).grid(row=0, column=0, sticky="w", padx=16, pady=(10, 4))
 
         self.strategy_dropdown = AnimatedDropdown(strategy_card, values=[""])
-        self.strategy_dropdown.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 14))
+        self.strategy_dropdown.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 12))
 
         self.start_btn = ctk.CTkButton(
             strategy_card,
@@ -931,18 +952,18 @@ class ZapretGUI(ctk.CTk):
             font=ctk.CTkFont(size=13, weight="bold"),
             command=self.start_strategy,
         )
-        self.start_btn.grid(row=1, column=1, padx=(0, 16), pady=(0, 14))
+        self.start_btn.grid(row=1, column=1, padx=(0, 16), pady=(0, 12))
 
         # --- Динамическая плашка-подсказка ---
         self.hint_card = ctk.CTkFrame(
             self.main_container, corner_radius=CORNER_RADIUS, fg_color=COLOR_WARN_BG,
             border_width=1, border_color=COLOR_WARN_BORDER
         )
-        self.hint_card.grid(row=4, column=0, sticky="ew", padx=24, pady=(0, 14))
+        self.hint_card.grid(row=4, column=0, sticky="ew", padx=20, pady=(0, 10))
         self.hint_card.grid_columnconfigure(1, weight=1)
 
         self.hint_icon = ctk.CTkLabel(self.hint_card, text="⚠️", font=ctk.CTkFont(size=16))
-        self.hint_icon.grid(row=0, column=0, padx=(14, 8), pady=12)
+        self.hint_icon.grid(row=0, column=0, padx=(14, 8), pady=9)
 
         self.hint_text = ctk.CTkLabel(
             self.hint_card,
@@ -950,26 +971,46 @@ class ZapretGUI(ctk.CTk):
             font=ctk.CTkFont(size=12), text_color=COLOR_WARN_TEXT,
             anchor="w", justify="left", wraplength=520
         )
-        self.hint_text.grid(row=0, column=1, sticky="ew", padx=(0, 14), pady=12)
+        self.hint_text.grid(row=0, column=1, sticky="ew", padx=(0, 14), pady=9)
 
         self.update_hint()
 
         # --- Recent strategies card (на месте бывшего лога) ---
         recent_card = self._card()
-        recent_card.grid(row=5, column=0, sticky="nsew", padx=24, pady=(0, 24))
+        recent_card.grid(row=5, column=0, sticky="nsew", padx=20, pady=(0, 16))
         self.main_container.grid_rowconfigure(5, weight=1)
         recent_card.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(
             recent_card, text="ПОСЛЕДНИЕ СТРАТЕГИИ", font=ctk.CTkFont(size=10, weight="bold"),
             text_color=COLOR_MUTED
-        ).grid(row=0, column=0, sticky="w", padx=16, pady=(14, 8))
+        ).grid(row=0, column=0, sticky="w", padx=16, pady=(10, 6))
 
         self.recent_list_frame = ctk.CTkFrame(recent_card, fg_color="transparent")
-        self.recent_list_frame.grid(row=1, column=0, sticky="new", padx=12, pady=(0, 14))
+        self.recent_list_frame.grid(row=1, column=0, sticky="new", padx=12, pady=(0, 6))
         self.recent_list_frame.grid_columnconfigure(0, weight=1)
 
         self.refresh_recent_ui()
+
+    def fit_to_content(self):
+        """
+        Подгоняет высоту окна под содержимое. Раньше размер был жёстко 700x560,
+        и когда в карточке папки появилась строка версии, нижняя «последняя»
+        стратегия уезжала за край окна.
+        """
+        self.update_idletasks()
+        if not self.main_container.winfo_ismapped():
+            return
+        # CTk масштабирует geometry()/minsize() сам, а winfo_* отдаёт реальные пиксели
+        scale = self._get_window_scaling()
+        need = math.ceil(self.main_container.winfo_reqheight() / scale)
+        current = round(self.winfo_height() / scale)
+        self.minsize(560, need)
+        # в первый раз ставим ровно по содержимому, потом только растём:
+        # если пользователь сам растянул окно, не сжимаем его обратно
+        if not self._fitted_once or current < need:
+            self.geometry(f"{round(self.winfo_width() / scale)}x{need}")
+            self._fitted_once = True
 
     def _card(self):
         return ctk.CTkFrame(
@@ -992,18 +1033,20 @@ class ZapretGUI(ctk.CTk):
 
         for i, name in enumerate(self.recent_strategies[:MAX_RECENT]):
             row = ctk.CTkFrame(self.recent_list_frame, corner_radius=CORNER_RADIUS, fg_color="#1c2128")
-            row.grid(row=i, column=0, sticky="ew", pady=(0, 8))
+            row.grid(row=i, column=0, sticky="ew", pady=(0, 6))
             row.grid_columnconfigure(0, weight=1)
 
             ctk.CTkLabel(
                 row, text=name, font=ctk.CTkFont(size=13), text_color=COLOR_TEXT, anchor="w"
-            ).grid(row=0, column=0, sticky="ew", padx=14, pady=10)
+            ).grid(row=0, column=0, sticky="ew", padx=14, pady=6)
 
             ctk.CTkButton(
-                row, text="▶  запустить снова", width=150, height=28, corner_radius=CORNER_RADIUS,
+                row, text="▶  запустить снова", width=150, height=26, corner_radius=CORNER_RADIUS,
                 fg_color="#262c36", hover_color="#30363d", text_color=COLOR_TEXT,
                 font=ctk.CTkFont(size=11), command=lambda n=name: self.launch_strategy_by_name(n),
-            ).grid(row=0, column=1, padx=(0, 10), pady=6)
+            ).grid(row=0, column=1, padx=(0, 8), pady=5)
+
+        self.fit_to_content()
 
     def remember_recent(self, name):
         self.recent_strategies = [name] + [s for s in self.recent_strategies if s != name]
@@ -1125,7 +1168,7 @@ class ZapretGUI(ctk.CTk):
 
     def set_directory(self, path: Path):
         self.zapret_dir = path
-        self.dir_label.configure(text=str(path))
+        self.dir_label.configure(text=shorten_path(path))
         self.config_data["zapret_dir"] = str(path)
         save_config(self.config_data)
         self.install_own_strategies()
