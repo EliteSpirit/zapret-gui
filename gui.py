@@ -37,6 +37,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import tkinter as tk
 import urllib.request
 import zipfile
@@ -389,6 +390,109 @@ def is_service_installed(name: str) -> bool:
         return result.returncode == 0
     except Exception:
         return False
+
+
+def is_service_running(name: str) -> bool:
+    # sc query работает и без прав администратора
+    try:
+        result = subprocess.run(
+            ["sc", "query", name], capture_output=True, text=True, creationflags=CREATE_NO_WINDOW
+        )
+        return result.returncode == 0 and "RUNNING" in result.stdout
+    except Exception:
+        return False
+
+
+ERROR_CANCELLED = 1223  # пользователь нажал «Нет» в окне UAC
+SEE_MASK_NOCLOSEPROCESS = 0x00000040
+WINDIVERT_SERVICES = ("WinDivert", "WinDivert14")
+STOP_WAIT_SECONDS = 15
+
+
+def run_elevated_and_wait(exe: str, params: str, timeout_s: int = 60) -> int:
+    """
+    Запускает exe с правами администратора (окно UAC) и ждёт завершения.
+    Обычный ShellExecute не отдаёт хэндл процесса, поэтому ShellExecuteEx.
+    """
+    from ctypes import wintypes
+
+    class ShellExecuteInfo(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.DWORD), ("fMask", ctypes.c_ulong), ("hwnd", wintypes.HWND),
+            ("lpVerb", wintypes.LPCWSTR), ("lpFile", wintypes.LPCWSTR),
+            ("lpParameters", wintypes.LPCWSTR), ("lpDirectory", wintypes.LPCWSTR),
+            ("nShow", ctypes.c_int), ("hInstApp", wintypes.HINSTANCE), ("lpIDList", ctypes.c_void_p),
+            ("lpClass", wintypes.LPCWSTR), ("hkeyClass", wintypes.HKEY), ("dwHotKey", wintypes.DWORD),
+            ("hIconOrMonitor", wintypes.HANDLE), ("hProcess", wintypes.HANDLE),
+        ]
+
+    info = ShellExecuteInfo()
+    info.cbSize = ctypes.sizeof(info)
+    info.fMask = SEE_MASK_NOCLOSEPROCESS
+    info.lpVerb = "runas"
+    info.lpFile = exe
+    info.lpParameters = params
+    info.nShow = 0  # SW_HIDE: консоль с командами показывать незачем
+
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    # мы в фоновом потоке, а ShellExecuteEx по документации требует COM в вызывающем потоке
+    ctypes.windll.ole32.CoInitializeEx(None, 0x2 | 0x4)  # APARTMENTTHREADED | DISABLE_OLE1DDE
+    if not shell32.ShellExecuteExW(ctypes.byref(info)):
+        err = ctypes.get_last_error()
+        if err == ERROR_CANCELLED:
+            raise UpdateError(
+                "Без прав администратора zapret не остановить, а без этого его файлы не перезаписать. "
+                "Подтверди запрос Windows (UAC) при следующей попытке."
+            )
+        raise UpdateError(f"Не удалось запустить остановку zapret (код {err}).")
+    try:
+        kernel32.WaitForSingleObject(info.hProcess, timeout_s * 1000)
+        code = wintypes.DWORD()
+        kernel32.GetExitCodeProcess(info.hProcess, ctypes.byref(code))
+        return code.value
+    finally:
+        kernel32.CloseHandle(info.hProcess)
+
+
+def stop_zapret(emit):
+    """
+    Перед обновлением останавливает всё, что держит файлы zapret: службу zapret
+    (иначе она поднимет winws.exe обратно), сам winws.exe и драйвер WinDivert
+    (он держит bin\\WinDivert64.sys). winws работает от администратора, поэтому
+    всё делается одним запросом UAC. Возвращает, что было запущено, чтобы
+    потом предложить запустить обратно.
+    """
+    was = {
+        "service": is_service_running("zapret"),
+        "winws": is_process_running(TARGET_PROCESS_NAME),
+    }
+    if not was["service"] and not was["winws"]:
+        return was
+
+    emit("progress", "Останавливаю zapret…")
+    emit("log", "Останавливаю zapret перед обновлением (Windows спросит права администратора)")
+    commands = []
+    if was["service"]:
+        commands.append("net stop zapret")
+    commands.append(f"taskkill /F /IM {TARGET_PROCESS_NAME}")
+    commands += [f"net stop {name}" for name in WINDIVERT_SERVICES]
+    # ошибки отдельных команд не важны (например, службы WinDivert14 может не быть):
+    # итог проверяем ниже по факту, жив ли winws.exe
+    run_elevated_and_wait("cmd.exe", "/c " + " & ".join(f"{c} >nul 2>&1" for c in commands))
+
+    for _ in range(STOP_WAIT_SECONDS * 2):
+        if not is_process_running(TARGET_PROCESS_NAME):
+            emit("log", "zapret остановлен")
+            return was
+        time.sleep(0.5)
+    raise UpdateError(
+        "winws.exe не завершился. Закрой окно \"zapret: ...\" вручную и повтори обновление."
+    )
+
+
+def start_service_elevated(name: str):
+    ctypes.windll.shell32.ShellExecuteW(None, "runas", "cmd.exe", f"/c net start {name}", None, 0)
 
 
 def update_zapret(zapret_dir: Path, version: str, emit):
@@ -1391,22 +1495,26 @@ class ZapretGUI(ctk.CTk):
             f"Установлена версия {local}, доступна {latest}.\n\n"
             f"Скачать релиз с github.com/{FLOWSEAL_REPO} и установить поверх текущей папки?\n\n"
             "Твои списки (*-user.txt), настройки game filter и режим ipset сохранятся. "
-            "Если что-то пойдёт не так, изменения откатятся.",
+            "Если что-то пойдёт не так, изменения откатятся."
+            + (
+                "\n\nzapret сейчас запущен: на время обновления он будет остановлен "
+                "(Windows спросит права администратора), потом предложу запустить его снова."
+                if is_process_running(TARGET_PROCESS_NAME) or is_service_running("zapret")
+                else ""
+            ),
         ):
-            return
-
-        if is_process_running(TARGET_PROCESS_NAME):
-            messagebox.showwarning(
-                "zapret запущен",
-                "winws.exe сейчас работает и держит свои файлы.\n\n"
-                "Закрой окно \"zapret: ...\" (а если стоит служба — удали её через "
-                "service.bat), затем повтори обновление.",
-            )
             return
 
         zapret_dir = self.zapret_dir
         self._set_updating(True)
         self.log(f"Обновляю zapret {local} → {latest}")
+
+        # что было запущено до обновления — заполняется в фоновом потоке
+        stopped = {"service": False, "winws": False}
+
+        def work(emit):
+            stopped.update(stop_zapret(emit))
+            return update_zapret(zapret_dir, latest, emit)
 
         def on_ok(version):
             self._set_updating(False)
@@ -1416,6 +1524,7 @@ class ZapretGUI(ctk.CTk):
             self.refresh_version_info()
             self.poll_status_once()
             messagebox.showinfo("Готово", f"zapret обновлён до версии {version}.")
+            self._offer_restart(stopped)
 
         def on_err(e):
             self._set_updating(False)
@@ -1423,8 +1532,23 @@ class ZapretGUI(ctk.CTk):
             self.poll_status_once()
             self.log(f"Ошибка обновления: {e}")
             messagebox.showerror("Обновление не удалось", str(e))
+            # файлы откатились к старой версии — её тоже можно запустить обратно
+            self._offer_restart(stopped)
 
-        self._run_in_background(lambda emit: update_zapret(zapret_dir, latest, emit), on_ok, on_err)
+        self._run_in_background(work, on_ok, on_err)
+
+    def _offer_restart(self, stopped):
+        if stopped["service"]:
+            if messagebox.askyesno("Запустить снова?", "Служба zapret была остановлена на время обновления. "
+                                                       "Запустить её снова?"):
+                self.log("Запускаю службу zapret")
+                start_service_elevated("zapret")
+                self.after(1500, self.poll_status_once)
+        elif stopped["winws"] and self.recent_strategies:
+            name = self.recent_strategies[0]
+            if messagebox.askyesno("Запустить снова?", f"zapret был остановлен на время обновления.\n\n"
+                                                       f"Запустить последнюю стратегию «{name}»?"):
+                self.launch_strategy_by_name(name)
 
     # ------------------------------------------------------------- status
 

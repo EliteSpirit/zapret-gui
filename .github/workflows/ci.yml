@@ -41,3 +41,6 @@ jobs:
       # настоящий запуск окна: стартовый экран и анимации без исключений
       - name: GUI smoke test
         run: python tests/smoke_gui.py
+
+      - name: Stop-before-update test
+        run: python tests/stop_test.py
