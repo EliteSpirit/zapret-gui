@@ -37,7 +37,14 @@ jobs:
       - name: Build exe
         run: |
           python tools/version_file.py ${{ inputs.version || github.ref_name }} > version.txt
-          python -m PyInstaller --noconfirm --onefile --windowed --name ZapretGUI --version-file version.txt --collect-all customtkinter --collect-all easing_functions gui.py
+          python -m PyInstaller --noconfirm --onefile --windowed --name ZapretGUI --version-file version.txt --collect-all customtkinter --collect-all easing_functions --add-data "strategies;strategies" gui.py
+
+      # релиз v1.0.1 вышел без strategies/ внутри exe, больше такого не пропускаем
+      - name: Check bundled strategies
+        shell: pwsh
+        run: |
+          $list = pyi-archive_viewer --list dist\ZapretGUI.exe | Out-String
+          if ($list -notmatch 'GUI MAX') { Write-Error "в exe нет strategies/general (GUI MAX).bat"; exit 1 }
 
       # Подпись через SignPath Foundation. Шаги ниже пропускаются, пока в
       # Settings -> Secrets and variables -> Actions не заведены переменная

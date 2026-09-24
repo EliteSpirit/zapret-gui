@@ -7,7 +7,7 @@
 ![CustomTkinter](https://img.shields.io/badge/UI-CustomTkinter-2ee673)
 ![License](https://img.shields.io/badge/License-MIT-lightgrey)
 
-> **Это только обёртка.** Программа не трогает сетевые пакеты — она запускает существующие `general*.bat` из твоей папки. Всю реальную работу с трафиком по-прежнему делает `winws.exe`. Единственное, что программа меняет в папке zapret, — файлы при обновлении, и только по твоему подтверждению (см. [Обновление zapret](#обновление-zapret)).
+> **Это только обёртка.** Программа не трогает сетевые пакеты — она запускает существующие `general*.bat` из твоей папки. Всю реальную работу с трафиком по-прежнему делает `winws.exe`. В папке zapret программа меняет только две вещи: кладёт туда свою стратегию `general (GUI MAX).bat` (см. [ниже](#экспериментальная-стратегия-gui-max)) и обновляет файлы сборки, но только по твоему подтверждению (см. [Обновление zapret](#обновление-zapret)).
 
 ---
 
@@ -183,7 +183,9 @@ Team roles:
 
 ### Privacy policy
 
-This program will not transfer any information to other networked systems unless specifically requested by the user or the person installing or operating it. Zapret GUI itself has no network code: it stores its settings in the Windows registry and launches the zapret `.bat` files that you select.
+This program will not transfer any information to other networked systems unless specifically requested by the user or the person installing or operating it, with one exception described below.
+
+To show whether a newer zapret build is available, Zapret GUI sends a plain HTTPS GET request to `raw.githubusercontent.com` (file `.service/version.txt` of [Flowseal/zapret-discord-youtube](https://github.com/Flowseal/zapret-discord-youtube)) on startup and when a zapret folder is selected. The request carries no personal data, only the `ZapretGUI` User-Agent; GitHub sees your IP address as with any web request. The update archive is downloaded from `github.com` only after you confirm the update. Settings are stored locally in the Windows registry.
 
 ## Лицензия
 
