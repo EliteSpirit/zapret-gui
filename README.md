@@ -11,9 +11,9 @@
 
 ### Быстрый старт
 
-1. Скачай и распакуй [zapret-discord-youtube](https://github.com/Flowseal/zapret-discord-youtube/releases) от Flowseal, если его ещё нет.
-2. Скачай `ZapretGUI.exe` по ссылке выше и запусти.
-3. Укажи папку, где лежит `service.bat`, выбери стратегию и нажми «Запустить». Windows спросит права администратора: без них zapret не работает.
+1. Скачай `ZapretGUI.exe` по ссылке выше и запусти.
+2. Программа спросит, есть ли у тебя zapret от Flowseal. Есть — укажи его папку. Нет — выбери, куда его поставить, и программа скачает последнюю версию сама. Если папка не пустая (например, Рабочий стол), zapret ляжет в подпапку `zapret-discord-youtube`.
+3. Выбери стратегию и нажми «Запустить». Windows спросит права администратора: без них zapret не работает.
 
 Не открывается YouTube или Discord? Попробуй другую стратегию из списка. Какая сработает, зависит от провайдера.
 
@@ -198,7 +198,7 @@ Team roles:
 
 This program will not transfer any information to other networked systems unless specifically requested by the user or the person installing or operating it, with one exception described below.
 
-To show whether a newer zapret build is available, Zapret GUI sends a plain HTTPS GET request to `raw.githubusercontent.com` (file `.service/version.txt` of [Flowseal/zapret-discord-youtube](https://github.com/Flowseal/zapret-discord-youtube)) on startup and when a zapret folder is selected. The request carries no personal data, only the `ZapretGUI` User-Agent; GitHub sees your IP address as with any web request. The update archive is downloaded from `github.com` only after you confirm the update. Settings are stored locally in the Windows registry.
+To show whether a newer zapret build is available, Zapret GUI sends a plain HTTPS GET request to `raw.githubusercontent.com` (file `.service/version.txt` of [Flowseal/zapret-discord-youtube](https://github.com/Flowseal/zapret-discord-youtube)) on startup and when a zapret folder is selected. The request carries no personal data, only the `ZapretGUI` User-Agent; GitHub sees your IP address as with any web request. The zapret archive is downloaded from `github.com` only after you confirm it: either an update or, on first run, the initial download of zapret. Settings are stored locally in the Windows registry.
 
 ## Лицензия
 

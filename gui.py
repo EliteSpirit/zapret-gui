@@ -495,48 +495,92 @@ def start_service_elevated(name: str):
     ctypes.windll.shell32.ShellExecuteW(None, "runas", "cmd.exe", f"/c net start {name}", None, 0)
 
 
-def update_zapret(zapret_dir: Path, version: str, emit):
-    """Скачивает релиз Flowseal и ставит его поверх zapret_dir. Работает в фоновом
-    потоке, поэтому с интерфейсом общается только через emit(kind, text)."""
+def download_release(version: str, tmp: Path, emit) -> Path:
+    """Скачивает и распаковывает релиз Flowseal во временную папку tmp с проверками
+    архива и версии. Возвращает папку, где лежит сама сборка."""
     if not VERSION_RE.match(version):
         raise UpdateError(f"Некорректная версия: {version!r}")
 
+    zip_path = tmp / "release.zip"
+    url = FLOWSEAL_ZIP_URL.format(v=version)
+    emit("log", f"Скачиваю {url}")
+
+    last_pct = [-1]
+
+    def on_progress(done, total):
+        pct = done * 100 // total if total else -1
+        if pct != last_pct[0]:
+            last_pct[0] = pct
+            emit("progress", f"Загрузка… {pct}%" if pct >= 0 else f"Загрузка… {done // 1024} КБ")
+
+    try:
+        download_file(url, zip_path, on_progress)
+    except UpdateError:
+        raise
+    except Exception as e:
+        raise UpdateError(f"Не удалось скачать релиз {version}: {e}") from e
+
+    emit("progress", "Распаковка…")
+    extracted = tmp / "extracted"
+    try:
+        extract_zip_safely(zip_path, extracted)
+    except zipfile.BadZipFile as e:
+        raise UpdateError(f"Скачанный архив повреждён: {e}") from e
+
+    new_root = find_release_root(extracted)
+    if new_root is None:
+        raise UpdateError(
+            "В архиве не нашлось service.bat и bin\\winws.exe — структура релиза изменилась."
+        )
+    new_version = read_local_version(new_root)
+    if new_version != version:
+        raise UpdateError(f"В архиве версия {new_version!r}, а ожидалась {version!r}.")
+    return new_root
+
+
+FRESH_INSTALL_DIRNAME = "zapret-discord-youtube"
+
+
+def fresh_install_target(chosen: Path) -> Path:
+    """В пустую папку ставим прямо в неё, в непустую (Рабочий стол и т.п.) — в подпапку,
+    чтобы не вывалить сотню файлов рядом с чужими."""
+    if not chosen.exists() or not any(chosen.iterdir()):
+        return chosen
+    return chosen / FRESH_INSTALL_DIRNAME
+
+
+def install_zapret_fresh(chosen: Path, emit) -> Path:
+    """Первая установка: скачивает последний релиз Flowseal в выбранную папку.
+    Возвращает папку, куда он встал."""
+    target = fresh_install_target(chosen)
+    if target.exists() and any(target.iterdir()):
+        raise UpdateError(
+            f"Папка {target} уже существует и не пустая. Если там уже zapret, ответь «Да» "
+            "на вопрос «У тебя уже скачан zapret?» и выбери эту папку. Иначе укажи другое место."
+        )
+    emit("progress", "Проверяю версию…")
+    try:
+        version = fetch_latest_version()
+    except Exception as e:
+        raise UpdateError(f"Не удалось узнать последнюю версию zapret: {e}") from e
+
+    with tempfile.TemporaryDirectory(prefix="zapretgui-install-") as tmp:
+        new_root = download_release(version, Path(tmp), emit)
+        emit("progress", "Установка…")
+        try:
+            shutil.copytree(new_root, target, dirs_exist_ok=True)
+        except OSError as e:
+            raise UpdateError(f"Не удалось записать файлы в {target}: {e}") from e
+    emit("log", f"zapret {version} установлен в {target}")
+    return target
+
+
+def update_zapret(zapret_dir: Path, version: str, emit):
+    """Скачивает релиз Flowseal и ставит его поверх zapret_dir. Работает в фоновом
+    потоке, поэтому с интерфейсом общается только через emit(kind, text)."""
     with tempfile.TemporaryDirectory(prefix="zapretgui-update-") as tmp:
         tmp = Path(tmp)
-        zip_path = tmp / "release.zip"
-        url = FLOWSEAL_ZIP_URL.format(v=version)
-        emit("log", f"Скачиваю {url}")
-
-        last_pct = [-1]
-
-        def on_progress(done, total):
-            pct = done * 100 // total if total else -1
-            if pct != last_pct[0]:
-                last_pct[0] = pct
-                emit("progress", f"Загрузка… {pct}%" if pct >= 0 else f"Загрузка… {done // 1024} КБ")
-
-        try:
-            download_file(url, zip_path, on_progress)
-        except UpdateError:
-            raise
-        except Exception as e:
-            raise UpdateError(f"Не удалось скачать релиз {version}: {e}") from e
-
-        emit("progress", "Распаковка…")
-        extracted = tmp / "extracted"
-        try:
-            extract_zip_safely(zip_path, extracted)
-        except zipfile.BadZipFile as e:
-            raise UpdateError(f"Скачанный архив повреждён: {e}") from e
-
-        new_root = find_release_root(extracted)
-        if new_root is None:
-            raise UpdateError(
-                "В архиве не нашлось service.bat и bin\\winws.exe — структура релиза изменилась."
-            )
-        new_version = read_local_version(new_root)
-        if new_version != version:
-            raise UpdateError(f"В архиве версия {new_version!r}, а ожидалась {version!r}.")
+        new_root = download_release(version, tmp, emit)
 
         # проверяем ещё раз прямо перед копированием: пока шла загрузка, стратегию могли запустить
         if is_process_running(TARGET_PROCESS_NAME):
@@ -830,8 +874,8 @@ class ZapretGUI(ctk.CTk):
         ).pack(anchor="w")
         ctk.CTkLabel(
             note_inner,
-            text="На следующем шаге нужно будет указать папку, куда распакован zapret —\n"
-                 "именно там, где лежат файлы general*.bat и service.bat.",
+            text="Дальше укажи папку с zapret от Flowseal (где лежат general*.bat\n"
+                 "и service.bat). Если его ещё нет, программа скачает его сама.",
             font=ctk.CTkFont(size=12), text_color=COLOR_MUTED, anchor="w", justify="left"
         ).pack(anchor="w", pady=(4, 0))
 
@@ -1260,7 +1304,42 @@ class ZapretGUI(ctk.CTk):
         if saved and Path(saved).exists():
             self.set_directory(Path(saved))
         else:
+            self.first_run_setup()
+
+    def first_run_setup(self):
+        have = messagebox.askyesno(
+            "zapret",
+            "У тебя уже скачан zapret от Flowseal (zapret-discord-youtube)?\n\n"
+            "Да — выбрать его папку.\n"
+            "Нет — программа сама скачает последнюю версию с GitHub в папку, которую ты укажешь.",
+        )
+        if have:
             self.choose_directory()
+            return
+        chosen = filedialog.askdirectory(title="Куда скачать zapret?")
+        if not chosen:
+            self.log("Установка zapret отменена: папка не выбрана")
+            return
+
+        self._set_updating(True)
+        self.log(f"Скачиваю zapret в {chosen}")
+
+        def on_ok(target):
+            self._set_updating(False)
+            self.set_directory(target)
+            messagebox.showinfo(
+                "Готово", f"zapret скачан в\n{target}\n\nВыбери стратегию и нажми «Запустить»."
+            )
+
+        def on_err(e):
+            self._set_updating(False)
+            self.refresh_version_info()
+            self.poll_status_once()
+            self.log(f"Не удалось скачать zapret: {e}")
+            if messagebox.askretrycancel("Не удалось скачать zapret", f"{e}\n\nПопробовать ещё раз?"):
+                self.first_run_setup()
+
+        self._run_in_background(lambda emit: install_zapret_fresh(Path(chosen), emit), on_ok, on_err)
 
     def choose_directory(self):
         if self._updating:
