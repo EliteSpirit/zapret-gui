@@ -22,6 +22,7 @@
 - [Где хранятся настройки](#где-хранятся-настройки)
 - [Чего программа не умеет (осознанно)](#чего-программа-не-умеет-осознанно)
 - [Частые вопросы](#частые-вопросы)
+- [Code signing policy](#code-signing-policy)
 - [Лицензия](#лицензия)
 
 ---
@@ -120,6 +121,21 @@ pyinstaller --noconfirm ZapretGUI.spec
 
 **Стратегия из «последних» не запускается.**
 Файл переименовали или удалили из папки — программа об этом предупредит.
+
+## Code signing policy
+
+Free code signing provided by [SignPath.io](https://about.signpath.io/), certificate by [SignPath Foundation](https://signpath.org/).
+
+Windows releases (`ZapretGUI.exe`) are built from this repository by the [Release workflow](.github/workflows/release.yml) on GitHub Actions and signed only after manual approval.
+
+Team roles:
+
+- Committers and reviewers: [EliteSpirit](https://github.com/EliteSpirit)
+- Approvers: [EliteSpirit](https://github.com/EliteSpirit)
+
+### Privacy policy
+
+This program will not transfer any information to other networked systems unless specifically requested by the user or the person installing or operating it. Zapret GUI itself has no network code: it stores its settings in the Windows registry and launches the zapret `.bat` files that you select.
 
 ## Лицензия
 

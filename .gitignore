@@ -17,3 +17,5 @@ dist/
 *.swp
 Thumbs.db
 desktop.ini
+
+version.txt

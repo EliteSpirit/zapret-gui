@@ -1,0 +1,78 @@
+name: Release
+
+# Два способа выпустить релиз:
+#   1. Actions -> Release -> Run workflow, вписать версию (например v0.1.0);
+#      тег на текущем main поставится сам.
+#   2. Запушить тег: git tag v0.1.0 && git push origin v0.1.0
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Версия, например v0.1.0"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: GUI smoke test
+        run: python tests/smoke_gui.py
+
+      - name: Build exe
+        run: |
+          python tools/version_file.py ${{ inputs.version || github.ref_name }} > version.txt
+          python -m PyInstaller --noconfirm --onefile --windowed --name ZapretGUI --version-file version.txt --collect-all customtkinter --collect-all easing_functions gui.py
+
+      # Подпись через SignPath Foundation. Шаги ниже пропускаются, пока в
+      # Settings -> Secrets and variables -> Actions не заведены переменная
+      # SIGNPATH_ORGANIZATION_ID и секрет SIGNPATH_API_TOKEN (их выдают после
+      # одобрения заявки). Каждую подпись нужно вручную подтвердить в SignPath.
+      - name: Upload unsigned exe
+        id: unsigned
+        if: vars.SIGNPATH_ORGANIZATION_ID != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZapretGUI-unsigned
+          path: dist/ZapretGUI.exe
+
+      - name: Sign with SignPath
+        if: vars.SIGNPATH_ORGANIZATION_ID != ''
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: zapret-gui
+          signing-policy-slug: release-signing
+          github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: dist
+
+      - name: Checksum
+        shell: pwsh
+        run: (Get-FileHash dist\ZapretGUI.exe -Algorithm SHA256).Hash.ToLower() + "  ZapretGUI.exe" | Out-File -Encoding ascii dist\ZapretGUI.exe.sha256
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.version || github.ref_name }}
+          target_commitish: ${{ github.sha }}
+          name: Zapret GUI ${{ inputs.version || github.ref_name }}
+          body_path: RELEASE_NOTES.md
+          files: |
+            dist/ZapretGUI.exe
+            dist/ZapretGUI.exe.sha256
