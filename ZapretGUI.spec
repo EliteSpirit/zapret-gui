@@ -1,7 +1,8 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = []
+# экспериментальные стратегии программы (см. install_bundled_strategies в gui.py)
+datas = [('strategies', 'strategies')]
 binaries = []
 hiddenimports = []
 # те же пакеты, что и в build.bat (--collect-all), иначе сборка

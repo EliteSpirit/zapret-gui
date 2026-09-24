@@ -8,7 +8,7 @@ pip install --upgrade -r requirements.txt
 
 echo.
 echo Собираю gui.exe...
-python -m PyInstaller --noconfirm --onefile --windowed --name "ZapretGUI" --collect-all customtkinter --collect-all easing_functions gui.py
+python -m PyInstaller --noconfirm --onefile --windowed --name "ZapretGUI" --collect-all customtkinter --collect-all easing_functions --add-data "strategies;strategies" gui.py
 
 echo.
 echo Готово. Файл находится в папке dist\ZapretGUI.exe
